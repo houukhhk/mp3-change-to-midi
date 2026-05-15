@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <title>HO mp3转midi v1.0</title>
+    <style>
+        body { font-family: system-ui, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px; line-height: 1.6; background: #f5f7fa; color: #333; }
+        .container { border: 1px solid #e1e4e8; padding: 30px; border-radius: 12px; background: white; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }
+        .btn { background: #007bff; color: white; padding: 12px 20px; border: none; border-radius: 6px; cursor: pointer; font-size: 16px; width: 100%; transition: 0.2s; font-weight: bold; }
+        .btn:hover { background: #0056b3; }
+        .btn:disabled { background: #cbd5e1; cursor: not-allowed; }
+        #status { margin-top: 15px; font-weight: bold; color: #4a5568; padding: 10px; background: #edf2f7; border-radius: 6px; text-align: center; }
+        .control-group { margin: 20px 0; padding: 15px; background: #f8fafc; border-radius: 8px; border: 1px solid #e2e8f0; }
+        .control-group label { display: block; font-weight: bold; margin-bottom: 5px; font-size: 14px; }
+        .slider-val { float: right; color: #007bff; font-weight: bold; }
+        #downloadArea { margin-top: 20px; }
+        .download-btn { background: #28a745; text-align: center; text-decoration: none; display: block; }
+        .download-btn:hover { background: #218838; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>HO mp3转midi v1.0</h2>
+    <img src="./fly-with-high.png" alt="MIDI Converter" style="width:100%; border-radius: 8px; margin-bottom: 20px;">
+    <p style="font-size: 14px; color: #666;"></p>
+    
+    <label style="display:block; margin-bottom:10px; font-weight:bold;">1. 選擇音訊檔案：</label>
+    <input type="file" id="audioFile" accept="audio/*" style="margin-bottom:10px;"><br>
+    
+    <div class="control-group">
+        <label>⚙️ 調音參數控制：</label>
+        
+        <label>🔇 靜音過濾門檻 (聲音消失請調低): <span id="thresholdVal" class="slider-val">0.05</span></label>
+        <input type="range" id="thresholdSlider" min="0.01" max="0.30" step="0.01" value="0.05" style="width:100%; margin-bottom:15px;">
+
+        <label>🧹 容錯門檻 (音準跑掉請調低): <span id="yinVal" class="slider-val">0.15</span></label>
+        <input type="range" id="yinSlider" min="0.05" max="0.30" step="0.01" value="0.15" style="width:100%;">
+    </div>
+    
+    <button id="convertBtn" class="btn" disabled>2. 開始精準轉換</button>
+    
+    <div id="status">請先選擇音訊檔案...</div>
+    <div id="downloadArea"></div>
+</div>
+
+<script>
+const audioFileInput = document.getElementById('audioFile');
+const convertBtn = document.getElementById('convertBtn');
+const statusDiv = document.getElementById('status');
+const downloadArea = document.getElementById('downloadArea');
+const thresholdSlider = document.getElementById('thresholdSlider');
+const thresholdVal = document.getElementById('thresholdVal');
+const yinSlider = document.getElementById('yinSlider');
+const yinVal = document.getElementById('yinVal');
+
+let audioBuffer = null;
+
+thresholdSlider.oninput = () => thresholdVal.innerText = thresholdSlider.value;
+yinSlider.oninput = () => yinVal.innerText = yinSlider.value;
+
+audioFileInput.addEventListener('change', async (e) => {
+    const file = e.target.files[0]; 
+    if (!file) return;
+
+    statusDiv.innerText = "⏳ 正在讀取音訊...";
+    convertBtn.disabled = true;
+    downloadArea.innerHTML = "";
+
+    try {
+        const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+        const audioCtx = new AudioContextClass();
+        
+        const arrayBuffer = await file.arrayBuffer(); 
+        
+        statusDiv.innerText = "⏳ 正在分析波形結構...";
+        
+        audioCtx.decodeAudioData(arrayBuffer, (buffer) => {
+            audioBuffer = buffer;
+            statusDiv.innerText = `✅ 載入成功！長度：${audioBuffer.duration.toFixed(1)} 秒`;
+            convertBtn.disabled = false;
+        }, () => {
+            statusDiv.innerText = "❌ 無法解碼此格式，請換成標準 MP3/WAV。";
+        });
+    } catch (err) {
+        statusDiv.innerText = "❌ 發生錯誤：" + err.message;
+    }
+});
+
+convertBtn.addEventListener('click', () => {
+    if (!audioBuffer) return;
+
+    statusDiv.innerText = "🚀 正在執行 YIN 演算法並同步時間軸...";
+    convertBtn.disabled = true;
+
+    setTimeout(() => {
+        try {
+            const rawData = audioBuffer.getChannelData(0);
+            const sampleRate = audioBuffer.sampleRate;
+
+            const hopSize = Math.floor(sampleRate * 0.025);
+            const fftSize = 2048; 
+            
+    
+            const secondsPerFrame = hopSize / sampleRate;
+            const ticksPerFrame = secondsPerFrame * 192; 
+
+            const rmsThreshold = parseFloat(thresholdSlider.value);
+            const yinThreshold = parseFloat(yinSlider.value);
+
+            let rawMidiSequence = [];
+            for (let i = 0; i < rawData.length - fftSize; i += hopSize) {
+                const slice = rawData.slice(i, i + fftSize);
+                
+                let rms = 0;
+                for (let j = 0; j < slice.length; j++) rms += slice[j] * slice[j];
+                rms = Math.sqrt(rms / slice.length);
+
+                let midiNote = null;
+                if (rms > rmsThreshold) {
+                    const frequency = detectPitchYIN(slice, sampleRate, yinThreshold);
+                    if (frequency && frequency > 40 && frequency < 2000) {
+                        midiNote = Math.round(12 * Math.log2(frequency / 440) + 69);
+                    }
+                }
+                rawMidiSequence.push(midiNote);
+            }
+
+            let smoothedSequence = [];
+            for (let i = 0; i < rawMidiSequence.length; i++) {
+                let start = Math.max(0, i - 1);
+                let end = Math.min(rawMidiSequence.length, i + 2);
+                let neighbors = rawMidiSequence.slice(start, end).filter(n => n !== null);
+                if (neighbors.length >= 2) {
+                    smoothedSequence.push(getMode(neighbors));
+                } else {
+                    smoothedSequence.push(null);
+                }
+            }
+
+            let notes = [];
+            let lastMidiNote = null;
+            let currentTicksAccumulator = 0;
+            let restTicksAccumulator = 0;
+
+            smoothedSequence.forEach(currentMidiNote => {
+                if (currentMidiNote === lastMidiNote) {
+                    if (currentMidiNote !== null) {
+                        currentTicksAccumulator += ticksPerFrame;
+                    } else {
+                        restTicksAccumulator += ticksPerFrame;
+                    }
+                } else {
+                    if (lastMidiNote !== null && currentTicksAccumulator > 0) {
+                        notes.push({ 
+                            note: lastMidiNote, 
+                            duration: Math.round(currentTicksAccumulator), 
+                            delta: Math.round(restTicksAccumulator) 
+                        });
+                        restTicksAccumulator = 0; 
+                    }
+                    
+                    if (currentMidiNote === null) {
+                        restTicksAccumulator += ticksPerFrame;
+                    } else {
+                        currentTicksAccumulator = ticksPerFrame;
+                    }
+                    lastMidiNote = currentMidiNote;
+                }
+            });
+            
+            if (lastMidiNote !== null && currentTicksAccumulator > 0) {
+                notes.push({ 
+                    note: lastMidiNote, 
+                    duration: Math.round(currentTicksAccumulator), 
+                    delta: Math.round(restTicksAccumulator) 
+                });
+            }
+
+            if (notes.length === 0) {
+                statusDiv.innerText = "⚠️ 未抓到有效音符。請調低「靜音過濾門檻」。";
+                convertBtn.disabled = false;
+                return;
+            }
+
+            const midiBytes = buildMidiFile(notes);
+            const blob = new Blob([new Uint8Array(midiBytes)], { type: "audio/mid" });
+            const url = URL.createObjectURL(blob);
+
+            downloadArea.innerHTML = "";
+            const downloadBtn = document.createElement('a');
+            downloadBtn.href = url;
+            downloadBtn.download = "synced_output.mid";
+            downloadBtn.className = "btn download-btn";
+            downloadBtn.innerText = "💾 下載 1:1 時間同步 MIDI 檔案";
+            
+            downloadArea.appendChild(downloadBtn);
+            statusDiv.innerText = `🎉 轉換完成！時間已精準同步，共轉換 ${notes.length} 個音符。`;
+        } catch (err) {
+            statusDiv.innerText = "❌ 轉換錯誤：" + err.message;
+            console.error(err);
+        } finally {
+            convertBtn.disabled = false;
+        }
+    }, 50);
+});
+
+function detectPitchYIN(buffer, sampleRate, yinThreshold) {
+    const halfBufferSize = Math.floor(buffer.length / 2);
+    let yinBuffer = new Float32Array(halfBufferSize);
+
+    for (let tau = 0; tau < halfBufferSize; tau++) {
+        for (let t = 0; t < halfBufferSize; t++) {
+            let delta = buffer[t] - buffer[t + tau];
+            yinBuffer[tau] += delta * delta;
+        }
+    }
+
+    let runningSum = 0;
+    yinBuffer[0] = 1;
+    for (let tau = 1; tau < halfBufferSize; tau++) {
+        runningSum += yinBuffer[tau];
+        yinBuffer[tau] *= tau / runningSum;
+    }
+
+    let tauPeak = -1;
+    for (let tau = 1; tau < halfBufferSize; tau++) {
+        if (yinBuffer[tau] < yinThreshold) {
+            while (tau + 1 < halfBufferSize && yinBuffer[tau + 1] < yinBuffer[tau]) {
+                tau++;
+            }
+            tauPeak = tau;
+            break;
+        }
+    }
+
+    if (tauPeak === -1) {
+        let minVal = 1e9;
+        for (let tau = 1; tau < halfBufferSize; tau++) {
+            if (yinBuffer[tau] < minVal) {
+                minVal = yinBuffer[tau];
+                tauPeak = tau;
+            }
+        }
+    }
+
+    if (tauPeak > 0) return sampleRate / tauPeak;
+    return null;
+}
+
+function getMode(arr) {
+    const modeMap = {};
+    let maxEl = arr[0], maxCount = 1;
+    for (let i = 0; i < arr.length; i++) {
+        const el = arr[i];
+        if (modeMap[el] == null) modeMap[el] = 1;
+        else modeMap[el]++;
+        if (modeMap[el] > maxCount) {
+            maxEl = el;
+            maxCount = modeMap[el];
+        }
+    }
+    return maxEl;
+}
+
+
+function buildMidiFile(notes) {
+    let trackData = [];
+    
+    notes.forEach(n => {
+        writeVariableLengthQuantity(trackData, n.delta);
+        trackData.push(0x90, n.note, 90);
+        
+        writeVariableLengthQuantity(trackData, n.duration);
+        trackData.push(0x80, n.note, 0); 
+    });
+    
+    trackData.push(0x00, 0xFF, 0x2F, 0x00);
+
+    const mthd = [0x4D, 0x54, 0x68, 0x64, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x01, 0x00, 0x60];
+    const mtrkHeader = [
+        0x4D, 0x54, 0x72, 0x6B,
+        (trackData.length >> 24) & 0xFF, 
+        (trackData.length >> 16) & 0xFF,
+        (trackData.length >> 8) & 0xFF, 
+        trackData.length & 0xFF
+    ];
+    return mthd.concat(mtrkHeader, trackData);
+}
+
+function writeVariableLengthQuantity(outputArray, value) {
+    let buffer = [];
+    buffer.push(value & 0x7F);
+    while ((value >>= 7) > 0) {
+        buffer.push((value & 0x7F) | 0x80);
+    }
+    for (let i = buffer.length - 1; i >= 0; i--) {
+        outputArray.push(buffer[i]);
+    }
+}
+</script>
+
+</body>
+</html>
